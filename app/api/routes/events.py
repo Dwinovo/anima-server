@@ -1,79 +1,101 @@
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any
+from threading import Lock
 
 from fastapi import APIRouter
-from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, Field, model_validator
 
 import app.runtime as runtime
+from app.api.schemas.events import ActionData
+from app.api.schemas.events import EventPayload
+from app.api.schemas.events import EventProcessData
+from app.api.schemas.events import PostItem
 from app.api.schemas.response import APIResponse
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+_POSTS_BY_SESSION: dict[str, list[PostItem]] = {}
+_POSTS_LOCK = Lock()
 
 
-class EventPayload(BaseModel):
-    session_id: str = Field(min_length=1)
-    when: dict[str, Any]
-    where: dict[str, Any]
-    who: dict[str, Any]
-    event: dict[str, Any]
+def _apply_action(session_id: str, actor_id: str, action: ActionData) -> list[PostItem]:
+    with _POSTS_LOCK:
+        posts = _POSTS_BY_SESSION.setdefault(session_id, [])
 
-    @model_validator(mode="after")
-    def validate_who_entity_uuid(self) -> "EventPayload":
-        entity_uuid = self.who.get("entity_uuid")
-        if not isinstance(entity_uuid, str) or not entity_uuid.strip():
-            raise ValueError("who.entity_uuid is required and must be a non-empty string")
-        return self
+        if action.type == "post" and action.post is not None:
+            posts.append(
+                PostItem.new(
+                    author_id=actor_id,
+                    content=action.post.content,
+                    media=action.post.media,
+                    visibility=action.post.visibility,
+                )
+            )
+        elif action.type == "like" and action.like is not None:
+            for idx, item in enumerate(posts):
+                if item.post_id == action.like.target_post_id:
+                    posts[idx] = item.model_copy(update={"like_count": item.like_count + 1})
+                    break
+        elif action.type == "comment" and action.comment is not None:
+            for idx, item in enumerate(posts):
+                if item.post_id == action.comment.target_post_id:
+                    posts[idx] = item.model_copy(update={"comment_count": item.comment_count + 1})
+                    break
+        elif action.type == "repost" and action.repost is not None:
+            target_exists = False
+            for idx, item in enumerate(posts):
+                if item.post_id == action.repost.target_post_id:
+                    posts[idx] = item.model_copy(update={"repost_count": item.repost_count + 1})
+                    target_exists = True
+                    break
+            if target_exists:
+                posts.append(
+                    PostItem.new(
+                        author_id=actor_id,
+                        content=action.repost.comment,
+                        repost_of_post_id=action.repost.target_post_id,
+                    )
+                )
+
+        return [post.model_copy() for post in posts]
 
 
-def _message_content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    return json.dumps(content, ensure_ascii=False, default=str)
+@router.post("/events", response_model=APIResponse[EventProcessData])
+def process_event(payload: EventPayload) -> APIResponse[EventProcessData]:
+    print(f"[events] Received /api/events payload: {json.dumps(payload.model_dump(), ensure_ascii=False)}")
 
-
-def _to_action_data(llm_text: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(llm_text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    return {"action": {"type": "chat", "content": llm_text}}
-
-
-@router.post("/events", response_model=APIResponse[dict[str, Any]])
-def process_event(payload: EventPayload) -> APIResponse[dict[str, Any]]:
-    logger.info(
-        "Received /api/events payload: %s",
-        json.dumps(payload.model_dump(), ensure_ascii=False),
-    )
-
-    entity_uuid = payload.who["entity_uuid"]
-    thread_id = f"{payload.session_id}:{entity_uuid}"
-    config = {"configurable": {"thread_id": thread_id}}
+    session_id = payload.meta.session_id
+    thread_id = f"{session_id}:{payload.who.entity_uuid}"
 
     event_5w = {
+        "meta": payload.meta.model_dump(),
         "when": payload.when,
         "where": payload.where,
-        "who": payload.who,
-        "event": payload.event,
+        "who": payload.who.model_dump(),
+        "event": payload.event.model_dump(),
     }
-    human_msg = HumanMessage(content=json.dumps(event_5w, ensure_ascii=False))
+    print(
+        "[events] Processing event "
+        f"session_id={session_id} thread_id={thread_id} "
+        f"event_5w={json.dumps(event_5w, ensure_ascii=False)}"
+    )
 
-    result = runtime.anima_app.invoke({"messages": [human_msg]}, config=config)
-    messages = result.get("messages", [])
-    if not messages:
-        action_data = {"action": {"type": "chat", "content": ""}}
-    else:
-        llm_text = _message_content_to_text(messages[-1].content)
-        action_data = _to_action_data(llm_text)
+    action = runtime.infer_action(thread_id=thread_id, event_5w=event_5w)
+    print(
+        f"[events] Inferred action thread_id={thread_id} "
+        f"action={json.dumps(action.model_dump(), ensure_ascii=False)}"
+    )
+    posts = _apply_action(session_id=session_id, actor_id=payload.who.entity_uuid, action=action)
+    print(
+        f"[events] Updated posts session_id={session_id} total_posts={len(posts)} "
+        f"posts={json.dumps([post.model_dump() for post in posts], ensure_ascii=False)}"
+    )
 
-    return APIResponse[dict[str, Any]].success(
-        data=action_data,
+    response_payload = APIResponse[EventProcessData].success(
+        data=EventProcessData(posts=posts),
         message="Event processed",
     )
+    print(
+        f"[events] Returning /api/events response thread_id={thread_id} "
+        f"payload={json.dumps(response_payload.model_dump(), ensure_ascii=False)}"
+    )
+    return response_payload

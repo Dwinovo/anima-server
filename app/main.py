@@ -1,3 +1,7 @@
+import logging
+import os
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -7,7 +11,27 @@ from app.api.schemas.response import APIResponse
 from app.api.router import router as api_router
 
 
+def configure_logging() -> None:
+    level_name = os.getenv("ANIMA_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    app_logger = logging.getLogger("app")
+    app_logger.setLevel(level)
+
+    # Uvicorn may not attach handlers for custom loggers; attach one explicitly.
+    if not app_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        handler.setLevel(level)
+        app_logger.addHandler(handler)
+
+    app_logger.propagate = False
+
+
 def create_app() -> FastAPI:
+    load_dotenv()
+    configure_logging()
     app = FastAPI(title="Anima Server")
     app.include_router(api_router)
 
