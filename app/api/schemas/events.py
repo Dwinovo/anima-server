@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import model_validator
+
+from app.domain.action_types import ActionType
 
 
 class MetaPayload(BaseModel):
@@ -36,8 +37,6 @@ class EventPayload(BaseModel):
 
 class PostActionPayload(BaseModel):
     content: str = Field(min_length=1)
-    media: list[str] = Field(default_factory=list)
-    visibility: Literal["public", "followers", "private"] = "public"
 
 
 class LikeActionPayload(BaseModel):
@@ -59,7 +58,7 @@ class NoopActionPayload(BaseModel):
 
 
 class ActionData(BaseModel):
-    type: Literal["post", "like", "comment", "repost", "noop"]
+    type: ActionType
     post: PostActionPayload | None = None
     like: LikeActionPayload | None = None
     comment: CommentActionPayload | None = None
@@ -68,6 +67,7 @@ class ActionData(BaseModel):
 
     @model_validator(mode="after")
     def validate_by_type(self) -> "ActionData":
+        action_type = self.type.value
         expected = {
             "post": self.post,
             "like": self.like,
@@ -76,10 +76,10 @@ class ActionData(BaseModel):
             "noop": self.noop,
         }
         for key, value in expected.items():
-            if key == self.type and value is None:
-                raise ValueError(f"action.{key} is required when type={self.type}")
-            if key != self.type and value is not None:
-                raise ValueError(f"action.{key} must be null when type={self.type}")
+            if key == action_type and value is None:
+                raise ValueError(f"action.{key} is required when type={action_type}")
+            if key != action_type and value is not None:
+                raise ValueError(f"action.{key} must be null when type={action_type}")
         return self
 
 
@@ -91,8 +91,6 @@ class PostItem(BaseModel):
     post_id: str
     author_id: str
     content: str
-    media: list[str] = Field(default_factory=list)
-    visibility: Literal["public", "followers", "private"] = "public"
     like_count: int = 0
     comment_count: int = 0
     repost_count: int = 0
@@ -104,16 +102,12 @@ class PostItem(BaseModel):
         *,
         author_id: str,
         content: str,
-        media: list[str] | None = None,
-        visibility: Literal["public", "followers", "private"] = "public",
         repost_of_post_id: str | None = None,
     ) -> "PostItem":
         return PostItem(
             post_id=str(uuid4()),
             author_id=author_id,
             content=content,
-            media=media or [],
-            visibility=visibility,
             repost_of_post_id=repost_of_post_id,
             created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )

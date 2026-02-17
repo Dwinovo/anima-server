@@ -8,13 +8,19 @@ from langchain_core.messages import AIMessage
 from langchain_core.messages import AnyMessage
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 
 from app.api.schemas.events import ActionData
-from app.api.schemas.events import ActionDecision
+from app.api.schemas.events import CommentActionPayload
+from app.api.schemas.events import LikeActionPayload
+from app.api.schemas.events import NoopActionPayload
+from app.api.schemas.events import PostActionPayload
+from app.api.schemas.events import RepostActionPayload
+from app.domain.action_types import ActionType
 
 try:
     from langchain_openai import ChatOpenAI
@@ -28,6 +34,47 @@ class AnimaState(TypedDict):
 
 def _passthrough_node(_: AnimaState) -> dict[str, Any]:
     return {}
+
+
+@tool(ActionType.POST.value)
+def post_action(
+    content: str,
+) -> str:
+    """Create a new post."""
+    return "ok"
+
+
+@tool(ActionType.LIKE.value)
+def like_action(target_post_id: str) -> str:
+    """Like an existing post by id."""
+    return "ok"
+
+
+@tool(ActionType.COMMENT.value)
+def comment_action(target_post_id: str, content: str) -> str:
+    """Comment on an existing post by id."""
+    return "ok"
+
+
+@tool(ActionType.REPOST.value)
+def repost_action(target_post_id: str, comment: str = "") -> str:
+    """Repost an existing post by id."""
+    return "ok"
+
+
+@tool(ActionType.NOOP.value)
+def noop_action(reason: str) -> str:
+    """Do nothing for this event."""
+    return "ok"
+
+
+_ACTION_TOOLS = [
+    post_action,
+    like_action,
+    comment_action,
+    repost_action,
+    noop_action,
+]
 
 
 memory = MemorySaver()
@@ -51,11 +98,7 @@ def _build_model():
         base_url=os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1"),
         temperature=float(os.getenv("MOONSHOT_TEMPERATURE", "0.6")),
     )
-    return model.with_structured_output(
-        ActionDecision,
-        method="function_calling",
-        include_raw=True,
-    )
+    return model.bind_tools(_ACTION_TOOLS, tool_choice="required")
 
 
 _action_model = None
@@ -91,32 +134,58 @@ def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
     ]
     config = {"configurable": {"thread_id": thread_id}}
 
-    result = _action_model.invoke(messages, config=config)
-    if not isinstance(result, dict):
-        raise RuntimeError("Structured output result format is invalid.")
-
-    raw_msg = result.get("raw")
-    parsed = result.get("parsed")
-    parsing_error = result.get("parsing_error")
-    raw_content = getattr(raw_msg, "content", raw_msg)
+    ai_msg = _action_model.invoke(messages, config=config)
+    raw_content = getattr(ai_msg, "content", ai_msg)
+    tool_calls = getattr(ai_msg, "tool_calls", None)
     print(
         f"[runtime] Raw model response thread_id={thread_id} "
         f"raw={json.dumps(raw_content, ensure_ascii=False, default=str)}"
     )
-    if parsing_error is not None:
-        raise RuntimeError(f"Structured parsing failed: {parsing_error}")
-    if not isinstance(parsed, ActionDecision):
-        raise RuntimeError("Model did not return parsed ActionDecision.")
+    print(
+        f"[runtime] Tool calls thread_id={thread_id} "
+        f"tool_calls={json.dumps(tool_calls, ensure_ascii=False, default=str)}"
+    )
+    if not tool_calls:
+        raise RuntimeError("Model did not return any tool call.")
 
-    action = parsed.action
+    tool_call = tool_calls[0]
+    tool_name = tool_call.get("name")
+    args = tool_call.get("args", {})
+    if isinstance(args, str):
+        args = json.loads(args)
+    if not isinstance(args, dict):
+        raise RuntimeError("Tool call args format is invalid.")
+
+    if tool_name == ActionType.POST.value:
+        action = ActionData(type=ActionType.POST, post=PostActionPayload(**args))
+    elif tool_name == ActionType.LIKE.value:
+        action = ActionData(type=ActionType.LIKE, like=LikeActionPayload(**args))
+    elif tool_name == ActionType.COMMENT.value:
+        action = ActionData(type=ActionType.COMMENT, comment=CommentActionPayload(**args))
+    elif tool_name == ActionType.REPOST.value:
+        action = ActionData(type=ActionType.REPOST, repost=RepostActionPayload(**args))
+    elif tool_name == ActionType.NOOP.value:
+        action = ActionData(type=ActionType.NOOP, noop=NoopActionPayload(**args))
+    else:
+        raise RuntimeError(f"Unsupported tool action: {tool_name}")
+
     print(
         f"[runtime] Action inference succeeded thread_id={thread_id} "
-        f"decision={parsed.model_dump_json(ensure_ascii=False)}"
+        f"decision={action.model_dump_json(ensure_ascii=False)}"
     )
 
     anima_app.update_state(config, {"messages": [HumanMessage(content=input_text)]})
     anima_app.update_state(
         config,
-        {"messages": [AIMessage(content=parsed.model_dump_json(ensure_ascii=False))]},
+        {
+            "messages": [
+                AIMessage(
+                    content=json.dumps(
+                        {"tool_name": tool_name, "args": args},
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        },
     )
     return action
