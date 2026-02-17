@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import traceback
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -16,7 +15,6 @@ from typing_extensions import Annotated, TypedDict
 
 from app.api.schemas.events import ActionData
 from app.api.schemas.events import ActionDecision
-from app.api.schemas.events import NoopActionPayload
 
 try:
     from langchain_openai import ChatOpenAI
@@ -39,22 +37,13 @@ _graph_builder.add_edge(START, "passthrough")
 _graph_builder.add_edge("passthrough", END)
 anima_app = _graph_builder.compile(checkpointer=memory)
 
-_system_prompt = (
-    "你是一个社交平台行为决策代理。"
-    "根据输入事件，为当前角色选择一个动作：post/like/comment/repost/noop。"
-    "必须严格按给定结构化 schema 输出。"
-)
-
-
 def _build_model():
     if ChatOpenAI is None:
-        print("[runtime] langchain_openai is not installed, fallback to noop action.")
-        return None
+        raise RuntimeError("langchain_openai is not installed.")
 
     api_key = os.getenv("MOONSHOT_API_KEY")
     if not api_key:
-        print("[runtime] MOONSHOT_API_KEY is not set, fallback to noop action.")
-        return None
+        raise RuntimeError("MOONSHOT_API_KEY is not set.")
 
     model = ChatOpenAI(
         model=os.getenv("MOONSHOT_MODEL", "kimi-k2-turbo-preview"),
@@ -62,10 +51,30 @@ def _build_model():
         base_url=os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1"),
         temperature=float(os.getenv("MOONSHOT_TEMPERATURE", "0.6")),
     )
-    return model
+    return model.with_structured_output(
+        ActionDecision,
+        method="function_calling",
+        include_raw=True,
+    )
 
 
-_action_model = _build_model()
+_action_model = None
+
+
+def _resolve_system_prompt(thread_id: str) -> str:
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpoint = memory.get_tuple(config)
+    if checkpoint is None:
+        raise RuntimeError(f"Agent profile is missing for thread_id={thread_id}.")
+
+    messages = checkpoint.checkpoint.get("channel_values", {}).get("messages", [])
+    for message in reversed(messages):
+        if isinstance(message, SystemMessage):
+            content = message.content
+            if isinstance(content, str) and content.strip():
+                return content
+
+    raise RuntimeError(f"Agent profile is missing for thread_id={thread_id}.")
 
 
 def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
@@ -73,10 +82,7 @@ def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
     if _action_model is None:
         _action_model = _build_model()
 
-    if _action_model is None:
-        return ActionData(type="noop", noop=NoopActionPayload(reason="model_not_configured"))
-
-    system_prompt = os.getenv("ANIMA_ACTION_SYSTEM_PROMPT", _system_prompt)
+    system_prompt = _resolve_system_prompt(thread_id)
     input_text = json.dumps(event_5w, ensure_ascii=False)
     print(f"[runtime] Starting action inference thread_id={thread_id} event_5w={input_text}")
     messages = [
@@ -85,32 +91,32 @@ def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
     ]
     config = {"configurable": {"thread_id": thread_id}}
 
-    try:
-        ai_msg = _action_model.invoke(messages, config=config)
-        raw_content = getattr(ai_msg, "content", ai_msg)
-        print(
-            f"[runtime] Raw model response thread_id={thread_id} "
-            f"raw={json.dumps(raw_content, ensure_ascii=False, default=str)}"
-        )
+    result = _action_model.invoke(messages, config=config)
+    if not isinstance(result, dict):
+        raise RuntimeError("Structured output result format is invalid.")
 
-        if isinstance(raw_content, str):
-            decision_obj = ActionDecision.model_validate_json(raw_content)
-        else:
-            decision_obj = ActionDecision.model_validate(raw_content)
+    raw_msg = result.get("raw")
+    parsed = result.get("parsed")
+    parsing_error = result.get("parsing_error")
+    raw_content = getattr(raw_msg, "content", raw_msg)
+    print(
+        f"[runtime] Raw model response thread_id={thread_id} "
+        f"raw={json.dumps(raw_content, ensure_ascii=False, default=str)}"
+    )
+    if parsing_error is not None:
+        raise RuntimeError(f"Structured parsing failed: {parsing_error}")
+    if not isinstance(parsed, ActionDecision):
+        raise RuntimeError("Model did not return parsed ActionDecision.")
 
-        action = decision_obj.action
-        print(
-            f"[runtime] Action inference succeeded thread_id={thread_id} "
-            f"decision={decision_obj.model_dump_json(ensure_ascii=False)}"
-        )
+    action = parsed.action
+    print(
+        f"[runtime] Action inference succeeded thread_id={thread_id} "
+        f"decision={parsed.model_dump_json(ensure_ascii=False)}"
+    )
 
-        anima_app.update_state(config, {"messages": [HumanMessage(content=input_text)]})
-        anima_app.update_state(
-            config,
-            {"messages": [AIMessage(content=decision_obj.model_dump_json(ensure_ascii=False))]},
-        )
-        return action
-    except Exception as exc:  # pragma: no cover - external model failure
-        print(f"[runtime] Action inference failed: {exc}")
-        print(traceback.format_exc())
-        return ActionData(type="noop", noop=NoopActionPayload(reason="action_inference_failed"))
+    anima_app.update_state(config, {"messages": [HumanMessage(content=input_text)]})
+    anima_app.update_state(
+        config,
+        {"messages": [AIMessage(content=parsed.model_dump_json(ensure_ascii=False))]},
+    )
+    return action

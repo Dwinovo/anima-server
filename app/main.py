@@ -10,6 +10,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api.schemas.response import APIResponse
 from app.api.router import router as api_router
 
+load_dotenv()
+
 
 def configure_logging() -> None:
     level_name = os.getenv("ANIMA_LOG_LEVEL", "INFO").upper()
@@ -30,7 +32,6 @@ def configure_logging() -> None:
 
 
 def create_app() -> FastAPI:
-    load_dotenv()
     configure_logging()
     app = FastAPI(title="Anima Server")
     app.include_router(api_router)
