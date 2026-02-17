@@ -83,16 +83,24 @@ class ActionData(BaseModel):
         return self
 
 
-class ActionDecision(BaseModel):
-    action: ActionData
+class PostLikeItem(BaseModel):
+    user_id: str
+    liked_at: str
+
+
+class PostCommentItem(BaseModel):
+    comment_id: str
+    user_id: str
+    content: str
+    created_at: str
 
 
 class PostItem(BaseModel):
     post_id: str
     author_id: str
     content: str
-    like_count: int = 0
-    comment_count: int = 0
+    likes: list[PostLikeItem] = Field(default_factory=list)
+    comments: list[PostCommentItem] = Field(default_factory=list)
     repost_count: int = 0
     repost_of_post_id: str | None = None
     created_at: str

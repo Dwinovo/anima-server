@@ -5,7 +5,8 @@ from langchain_core.messages import SystemMessage
 from pydantic import BaseModel, Field
 
 from app.api.schemas.response import APIResponse
-from app.runtime import anima_app, memory
+from app.prompts import render_agent_system_prompt
+from app.runtime import anima_app
 
 router = APIRouter()
 
@@ -39,8 +40,20 @@ def register_agent(
     thread_id = f"{payload.session_id}:{payload.entity_uuid}"
     config = {"configurable": {"thread_id": thread_id}}
 
-    checkpoint = memory.get_tuple(config)
-    if checkpoint is not None:
+    # 幂等注册：若已有有效 system prompt，直接返回 existing。
+    snapshot = anima_app.get_state(config)
+    values = snapshot.values if isinstance(snapshot.values, dict) else {}
+    messages = values.get("messages", [])
+    has_system_prompt = False
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                content = msg.content
+                if isinstance(content, str) and content.strip():
+                    has_system_prompt = True
+                    break
+
+    if has_system_prompt:
         response.status_code = status.HTTP_200_OK
         return APIResponse[AgentRegisterData].success(
             data=AgentRegisterData(
@@ -50,7 +63,15 @@ def register_agent(
             message="agent already exists",
         )
 
-    sys_msg = SystemMessage(content=payload.profile)
+    sys_msg = SystemMessage(
+        # 注册时将平台规则、身份与人设渲染成统一 system prompt 写入线程状态。
+        content=render_agent_system_prompt(
+            session_id=payload.session_id,
+            entity_uuid=payload.entity_uuid,
+            entity_type=payload.entity_type,
+            profile=payload.profile,
+        )
+    )
     anima_app.update_state(config, {"messages": [sys_msg]})
     response.status_code = status.HTTP_201_CREATED
     return APIResponse[AgentRegisterData].success(

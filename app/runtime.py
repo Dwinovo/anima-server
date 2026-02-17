@@ -8,7 +8,6 @@ from langchain_core.messages import AIMessage
 from langchain_core.messages import AnyMessage
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
-from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -16,10 +15,13 @@ from typing_extensions import Annotated, TypedDict
 
 from app.api.schemas.events import ActionData
 from app.api.schemas.events import CommentActionPayload
+from app.api.schemas.events import EventPayload
 from app.api.schemas.events import LikeActionPayload
 from app.api.schemas.events import NoopActionPayload
 from app.api.schemas.events import PostActionPayload
+from app.api.schemas.events import PostItem
 from app.api.schemas.events import RepostActionPayload
+from app.domain.action_tools import ACTION_TOOLS
 from app.domain.action_types import ActionType
 
 try:
@@ -36,47 +38,7 @@ def _passthrough_node(_: AnimaState) -> dict[str, Any]:
     return {}
 
 
-@tool(ActionType.POST.value)
-def post_action(
-    content: str,
-) -> str:
-    """Create a new post."""
-    return "ok"
-
-
-@tool(ActionType.LIKE.value)
-def like_action(target_post_id: str) -> str:
-    """Like an existing post by id."""
-    return "ok"
-
-
-@tool(ActionType.COMMENT.value)
-def comment_action(target_post_id: str, content: str) -> str:
-    """Comment on an existing post by id."""
-    return "ok"
-
-
-@tool(ActionType.REPOST.value)
-def repost_action(target_post_id: str, comment: str = "") -> str:
-    """Repost an existing post by id."""
-    return "ok"
-
-
-@tool(ActionType.NOOP.value)
-def noop_action(reason: str) -> str:
-    """Do nothing for this event."""
-    return "ok"
-
-
-_ACTION_TOOLS = [
-    post_action,
-    like_action,
-    comment_action,
-    repost_action,
-    noop_action,
-]
-
-
+# LangGraph 内存型 checkpointer：按 thread_id 维护每个 Agent 的消息状态。
 memory = MemorySaver()
 _graph_builder = StateGraph(AnimaState)
 _graph_builder.add_node("passthrough", _passthrough_node)
@@ -98,19 +60,37 @@ def _build_model():
         base_url=os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1"),
         temperature=float(os.getenv("MOONSHOT_TEMPERATURE", "0.6")),
     )
-    return model.bind_tools(_ACTION_TOOLS, tool_choice="required")
+    return model.bind_tools(ACTION_TOOLS, tool_choice="required")
 
 
 _action_model = None
 
 
-def _resolve_system_prompt(thread_id: str) -> str:
+def _get_thread_messages(thread_id: str) -> list[AnyMessage]:
+    """通过 LangGraph state API 读取指定 thread 的消息列表。"""
     config = {"configurable": {"thread_id": thread_id}}
-    checkpoint = memory.get_tuple(config)
-    if checkpoint is None:
-        raise RuntimeError(f"Agent profile is missing for thread_id={thread_id}.")
+    snapshot = anima_app.get_state(config)
+    values = snapshot.values if isinstance(snapshot.values, dict) else {}
+    messages = values.get("messages", [])
+    if isinstance(messages, list):
+        return messages
+    return []
 
-    messages = checkpoint.checkpoint.get("channel_values", {}).get("messages", [])
+
+def _resolve_history_messages(thread_id: str) -> list[AnyMessage]:
+    """读取该 Agent 的历史 Human/AI 消息，作为下一次推理上下文。"""
+    messages = _get_thread_messages(thread_id)
+    # 历史窗口可配置；0 或负数表示不截断。
+    history_limit = int(os.getenv("ANIMA_HISTORY_LIMIT", "20"))
+    history_messages = [msg for msg in messages if isinstance(msg, (HumanMessage, AIMessage))]
+    if history_limit <= 0:
+        return history_messages
+    return history_messages[-history_limit:]
+
+
+def _resolve_system_prompt(thread_id: str) -> str:
+    # 从该线程历史中反向查找最近一条 SystemMessage，作为当前推理的人设与规则基线。
+    messages = _get_thread_messages(thread_id)
     for message in reversed(messages):
         if isinstance(message, SystemMessage):
             content = message.content
@@ -120,17 +100,48 @@ def _resolve_system_prompt(thread_id: str) -> str:
     raise RuntimeError(f"Agent profile is missing for thread_id={thread_id}.")
 
 
-def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
+def list_thread_ids_by_session(session_id: str) -> list[str]:
+    # 从 checkpoint 中枚举同一 session 下所有已注册 thread_id。
+    # 注意：这里仍直接读取 checkpointer；若未来切换外部存储，可考虑单独维护索引表。
+    prefix = f"{session_id}:"
+    thread_ids: set[str] = set()
+
+    for checkpoint in memory.list(None):
+        configurable = checkpoint.config.get("configurable", {})
+        thread_id = configurable.get("thread_id")
+        if isinstance(thread_id, str) and thread_id.startswith(prefix):
+            thread_ids.add(thread_id)
+
+    return sorted(thread_ids)
+
+
+def infer_action(
+    *,
+    thread_id: str,
+    event_payload: EventPayload,
+    social_posts: list[PostItem],
+) -> ActionData:
     global _action_model
     if _action_model is None:
         _action_model = _build_model()
 
     system_prompt = _resolve_system_prompt(thread_id)
-    input_text = json.dumps(event_5w, ensure_ascii=False)
-    print(f"[runtime] Starting action inference thread_id={thread_id} event_5w={input_text}")
+    history_messages = _resolve_history_messages(thread_id)
+    # 统一在 runtime 层完成事件序列化，并移除 perspective。
+    current_event = event_payload.model_dump(exclude={"who": {"perspective"}})
+    # 给模型的当前输入：社交平台帖子快照 + 当前事件。
+    inference_input = {
+        "social_posts": [post.model_dump() for post in social_posts],
+        "current_event": current_event,
+    }
+    inference_input_text = json.dumps(inference_input, ensure_ascii=False)
+    print(f"[runtime] Starting action inference thread_id={thread_id} input={inference_input_text}")
+    # 输入由四部分组成：系统提示词 + 历史事件/动作 + 社交平台帖子 + 当前事件。
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=input_text),
+        # 带入该 Agent 过去的事件和动作，保证“记得发生过什么、做过什么”。
+        *history_messages,
+        HumanMessage(content=inference_input_text),
     ]
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -148,6 +159,7 @@ def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
     if not tool_calls:
         raise RuntimeError("Model did not return any tool call.")
 
+    # 解析首个 tool call 为动作结果；当前策略要求模型必须走工具调用。
     tool_call = tool_calls[0]
     tool_name = tool_call.get("name")
     args = tool_call.get("args", {})
@@ -174,7 +186,12 @@ def infer_action(*, thread_id: str, event_5w: dict[str, Any]) -> ActionData:
         f"decision={action.model_dump_json(ensure_ascii=False)}"
     )
 
-    anima_app.update_state(config, {"messages": [HumanMessage(content=input_text)]})
+    # 将本次“事件输入 + 动作输出”写回 thread 状态，供下次推理作为历史上下文。
+    # 历史里仅保留当前事件，避免把整个平台帖子快照反复写入记忆导致上下文膨胀。
+    anima_app.update_state(
+        config,
+        {"messages": [HumanMessage(content=json.dumps(current_event, ensure_ascii=False))]},
+    )
     anima_app.update_state(
         config,
         {

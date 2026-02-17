@@ -8,37 +8,34 @@ import app.runtime as runtime
 from app.api.schemas.events import EventPayload
 from app.api.schemas.events import EventProcessData
 from app.api.schemas.response import APIResponse
-from app.services.action_executor import apply_action
+from app.services.event_workflow import run_event_workflow
 
 router = APIRouter()
 
 
 @router.post("/events", response_model=APIResponse[EventProcessData])
 def process_event(payload: EventPayload) -> APIResponse[EventProcessData]:
+    # 入口日志：保留原始请求，便于排查上游事件字段问题。
     print(f"[events] Received /api/events payload: {json.dumps(payload.model_dump(), ensure_ascii=False)}")
 
+    # source_thread_id 代表事件来源实体；target_thread_ids 代表本次要参与决策的 Agent 集合。
     session_id = payload.meta.session_id
-    thread_id = f"{session_id}:{payload.who.entity_uuid}"
+    source_thread_id = f"{session_id}:{payload.who.entity_uuid}"
+    target_thread_ids = runtime.list_thread_ids_by_session(session_id)
 
-    event_5w = {
-        "meta": payload.meta.model_dump(),
-        "when": payload.when,
-        "where": payload.where,
-        "who": payload.who.model_dump(),
-        "event": payload.event.model_dump(),
-    }
     print(
         "[events] Processing event "
-        f"session_id={session_id} thread_id={thread_id} "
-        f"event_5w={json.dumps(event_5w, ensure_ascii=False)}"
+        f"session_id={session_id} target_thread_ids={target_thread_ids} "
+        f"event={json.dumps(payload.model_dump(exclude={'who': {'perspective'}}), ensure_ascii=False)}"
     )
 
-    action = runtime.infer_action(thread_id=thread_id, event_5w=event_5w)
-    print(
-        f"[events] Inferred action thread_id={thread_id} "
-        f"action={json.dumps(action.model_dump(), ensure_ascii=False)}"
+    # 用图编排执行：infer 节点并发，动作提交节点串行，兼顾吞吐和状态一致性。
+    posts = run_event_workflow(
+        session_id=session_id,
+        event_payload=payload,
+        target_thread_ids=target_thread_ids,
     )
-    posts = apply_action(session_id=session_id, actor_id=payload.who.entity_uuid, action=action)
+
     print(
         f"[events] Updated posts session_id={session_id} total_posts={len(posts)} "
         f"posts={json.dumps([post.model_dump() for post in posts], ensure_ascii=False)}"
@@ -49,7 +46,7 @@ def process_event(payload: EventPayload) -> APIResponse[EventProcessData]:
         message="Event processed",
     )
     print(
-        f"[events] Returning /api/events response thread_id={thread_id} "
+        f"[events] Returning /api/events response source_thread_id={source_thread_id} "
         f"payload={json.dumps(response_payload.model_dump(), ensure_ascii=False)}"
     )
     return response_payload
