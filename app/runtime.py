@@ -13,14 +13,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 
-from app.api.schemas.events import ActionData
-from app.api.schemas.events import CommentActionPayload
-from app.api.schemas.events import EventPayload
-from app.api.schemas.events import LikeActionPayload
-from app.api.schemas.events import NoopActionPayload
-from app.api.schemas.events import PostActionPayload
-from app.api.schemas.events import PostItem
-from app.api.schemas.events import RepostActionPayload
+from app.api.schemas.actions import ActionData
+from app.api.schemas.actions import CommentActionPayload
+from app.api.schemas.actions import LikeActionPayload
+from app.api.schemas.actions import NoopActionPayload
+from app.api.schemas.actions import PostActionPayload
+from app.api.schemas.actions import RepostActionPayload
+from app.api.schemas.events import EventRequest
+from app.api.schemas.posts import PostItem
 from app.domain.action_tools import ACTION_TOOLS
 from app.domain.action_types import ActionType
 
@@ -118,7 +118,7 @@ def list_thread_ids_by_session(session_id: str) -> list[str]:
 def infer_action(
     *,
     thread_id: str,
-    event_payload: EventPayload,
+    event_payload: EventRequest,
     social_posts: list[PostItem],
 ) -> ActionData:
     global _action_model
@@ -127,8 +127,8 @@ def infer_action(
 
     system_prompt = _resolve_system_prompt(thread_id)
     history_messages = _resolve_history_messages(thread_id)
-    # 统一在 runtime 层完成事件序列化，并移除 perspective。
-    current_event = event_payload.model_dump(exclude={"who": {"perspective"}})
+    # 统一在 runtime 层完成事件序列化。
+    current_event = event_payload.model_dump()
     # 给模型的当前输入：社交平台帖子快照 + 当前事件。
     inference_input = {
         "social_posts": [post.model_dump() for post in social_posts],

@@ -8,9 +8,9 @@ from langgraph.constants import Send
 from langgraph.graph import END, START, StateGraph
 
 import app.runtime as runtime
-from app.api.schemas.events import ActionData
-from app.api.schemas.events import EventPayload
-from app.api.schemas.events import PostItem
+from app.api.schemas.actions import ActionData
+from app.api.schemas.events import EventRequest
+from app.api.schemas.posts import PostItem
 from app.services.action_executor import apply_action
 from app.services.action_executor import get_posts
 
@@ -22,7 +22,7 @@ class InferredActionItem(TypedDict):
 
 class EventWorkflowState(TypedDict):
     session_id: str
-    event_payload: EventPayload
+    event_payload: EventRequest
     target_thread_ids: list[str]
     social_posts: list[PostItem]
     thread_id: str
@@ -89,7 +89,7 @@ _event_workflow_app = _graph_builder.compile()
 def run_event_workflow(
     *,
     session_id: str,
-    event_payload: EventPayload,
+    event_payload: EventRequest,
     target_thread_ids: list[str],
 ) -> list[PostItem]:
     # 固定本轮可见帖子快照：同一轮并发 Agent 看到一致的社交平台上下文。

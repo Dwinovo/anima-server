@@ -4,46 +4,36 @@ import json
 
 from fastapi import APIRouter
 
-import app.runtime as runtime
-from app.api.schemas.events import EventPayload
-from app.api.schemas.events import EventProcessData
+from app.api.schemas.events import EventResponse
+from app.api.schemas.events import EventRequest
 from app.api.schemas.response import APIResponse
-from app.services.event_workflow import run_event_workflow
+from app.services.neo4j_event_store import ingest_minecraft_event
 
 router = APIRouter()
 
 
-@router.post("/events", response_model=APIResponse[EventProcessData])
-def process_event(payload: EventPayload) -> APIResponse[EventProcessData]:
+@router.post("/events", response_model=APIResponse[EventResponse], status_code=201)
+def process_event(payload: EventRequest) -> APIResponse[EventResponse]:
     # 入口日志：保留原始请求，便于排查上游事件字段问题。
     print(f"[events] Received /api/events payload: {json.dumps(payload.model_dump(), ensure_ascii=False)}")
 
-    # source_thread_id 代表事件来源实体；target_thread_ids 代表本次要参与决策的 Agent 集合。
-    session_id = payload.meta.session_id
-    source_thread_id = f"{session_id}:{payload.who.entity_uuid}"
-    target_thread_ids = runtime.list_thread_ids_by_session(session_id)
+    # source_thread_id 仅用于日志定位；当前阶段只接收并确认创建事件。
+    session_id = payload.session_id
+    source_thread_id = f"{session_id}:{payload.subject.entity_id}"
 
     print(
-        "[events] Processing event "
-        f"session_id={session_id} target_thread_ids={target_thread_ids} "
-        f"event={json.dumps(payload.model_dump(exclude={'who': {'perspective'}}), ensure_ascii=False)}"
+        "[events] Event create ack mode "
+        f"session_id={session_id} source_thread_id={source_thread_id} "
+        f"event={json.dumps(payload.model_dump(), ensure_ascii=False)}"
     )
+    ingest_minecraft_event(payload)
+    print(f"[events] Event persisted to Neo4j session_id={session_id} source_thread_id={source_thread_id}")
 
-    # 用图编排执行：infer 节点并发，动作提交节点串行，兼顾吞吐和状态一致性。
-    posts = run_event_workflow(
-        session_id=session_id,
-        event_payload=payload,
-        target_thread_ids=target_thread_ids,
-    )
-
-    print(
-        f"[events] Updated posts session_id={session_id} total_posts={len(posts)} "
-        f"posts={json.dumps([post.model_dump() for post in posts], ensure_ascii=False)}"
-    )
-
-    response_payload = APIResponse[EventProcessData].success(
-        data=EventProcessData(posts=posts),
-        message="Event processed",
+    response_payload = APIResponse[EventResponse].success(
+        data=EventResponse(
+            session_id=session_id,
+        ),
+        message="event created",
     )
     print(
         f"[events] Returning /api/events response source_thread_id={source_thread_id} "

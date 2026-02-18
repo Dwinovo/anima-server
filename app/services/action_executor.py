@@ -4,10 +4,10 @@ from datetime import datetime, timezone
 from threading import Lock
 from uuid import uuid4
 
-from app.api.schemas.events import ActionData
-from app.api.schemas.events import PostCommentItem
-from app.api.schemas.events import PostLikeItem
-from app.api.schemas.events import PostItem
+from app.api.schemas.actions import ActionData
+from app.api.schemas.posts import PostCommentItem
+from app.api.schemas.posts import PostLikeItem
+from app.api.schemas.posts import PostItem
 from app.domain.action_types import ActionType
 
 _POSTS_BY_SESSION: dict[str, list[PostItem]] = {}
