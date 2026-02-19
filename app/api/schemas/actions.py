@@ -19,11 +19,6 @@ class CommentActionPayload(BaseModel):
     content: str = Field(min_length=1)
 
 
-class RepostActionPayload(BaseModel):
-    target_post_id: str = Field(min_length=1)
-    comment: str = ""
-
-
 class NoopActionPayload(BaseModel):
     reason: str = Field(min_length=1)
 
@@ -33,7 +28,6 @@ class ActionData(BaseModel):
     post: PostActionPayload | None = None
     like: LikeActionPayload | None = None
     comment: CommentActionPayload | None = None
-    repost: RepostActionPayload | None = None
     noop: NoopActionPayload | None = None
 
     @model_validator(mode="after")
@@ -43,7 +37,6 @@ class ActionData(BaseModel):
             "post": self.post,
             "like": self.like,
             "comment": self.comment,
-            "repost": self.repost,
             "noop": self.noop,
         }
         for key, value in expected.items():

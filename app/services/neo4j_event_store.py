@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from neo4j import Driver
 from neo4j import GraphDatabase
+from neo4j import NotificationMinimumSeverity
 
 from app.api.schemas.events import EventRequest
 from app.api.schemas.events import MinecraftEntity
@@ -60,7 +61,12 @@ def get_neo4j_driver() -> Driver:
 
     with _DRIVER_LOCK:
         if _DRIVER is None:
-            _DRIVER = GraphDatabase.driver(url, auth=(username, password))
+            _DRIVER = GraphDatabase.driver(
+                url,
+                auth=(username, password),
+                # 关闭 DBMS notification，避免 deprecation/schema 提示刷屏。
+                notifications_min_severity=NotificationMinimumSeverity.OFF,
+            )
     return _DRIVER
 
 

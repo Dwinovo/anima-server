@@ -99,3 +99,21 @@ class EventRequest(BaseModel):
 
 class EventResponse(BaseModel):
     session_id: str
+
+
+class EventTickRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+
+class TickAgentResult(BaseModel):
+    agent_uuid: str
+    success: bool
+    message: str
+
+
+class EventTickResponse(BaseModel):
+    session_id: str
+    total_agents: int
+    succeeded: int
+    failed: int
+    results: list[TickAgentResult] = Field(default_factory=list)

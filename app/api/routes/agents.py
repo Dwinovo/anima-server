@@ -54,6 +54,14 @@ def register_agent(
                     break
 
     if has_system_prompt:
+        # 即使是 existing，也刷新关键系统上下文，保证后续执行节点可安全读取。
+        anima_app.update_state(
+            config,
+            {
+                "session_id": payload.session_id,
+                "agent_uuid": payload.entity_uuid,
+            },
+        )
         response.status_code = status.HTTP_200_OK
         return APIResponse[AgentRegisterData].success(
             data=AgentRegisterData(
@@ -72,7 +80,15 @@ def register_agent(
             profile=payload.profile,
         )
     )
-    anima_app.update_state(config, {"messages": [sys_msg]})
+    anima_app.update_state(
+        config,
+        {
+            "session_id": payload.session_id,
+            "agent_uuid": payload.entity_uuid,
+            "recent_memory": "",
+            "messages": [sys_msg],
+        },
+    )
     response.status_code = status.HTTP_201_CREATED
     return APIResponse[AgentRegisterData].success(
         data=AgentRegisterData(
