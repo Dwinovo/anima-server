@@ -105,6 +105,11 @@ class EventTickRequest(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class EventTickAcceptedData(BaseModel):
+    status: str
+    session_id: str
+
+
 class TickAgentResult(BaseModel):
     agent_uuid: str
     success: bool

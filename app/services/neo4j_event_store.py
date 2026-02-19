@@ -46,6 +46,20 @@ def _snapshot_relationship_properties(entity: MinecraftEntity) -> dict[str, obje
     }
 
 
+def _format_entity_display_name(name: str | None, entity_id: str) -> str:
+    """统一实体显示名：`name#uuid前五位`。
+
+    规则：
+    - 若 name 为空，回退到 entity_id 作为名字部分；
+    - uuid 前缀取 entity_id 的前 5 个字符（长度不足 5 则按实际长度）。
+    """
+
+    normalized_id = entity_id.strip() or "unknown"
+    normalized_name = name.strip() if isinstance(name, str) else ""
+    base_name = normalized_name or normalized_id
+    return f"{base_name}#{normalized_id[:5]}"
+
+
 def get_neo4j_driver() -> Driver:
     """返回全局 Neo4j Driver（懒加载 + 线程安全）。"""
 
@@ -127,7 +141,10 @@ def ingest_event_to_neo4j(driver: Driver, event: EventRequest) -> str:
         "verb": event.action.verb,
         "details": json.dumps(event.action.details, ensure_ascii=False),
         "sub_id": event.subject.entity_id,
-        "sub_name": event.subject.name,
+        "sub_name": _format_entity_display_name(
+            event.subject.name,
+            event.subject.entity_id,
+        ),
         "sub_type": event.subject.entity_type,
         "subject_snapshot": _snapshot_relationship_properties(event.subject),
     }
@@ -136,7 +153,10 @@ def ingest_event_to_neo4j(driver: Driver, event: EventRequest) -> str:
         params.update(
             {
                 "obj_id": event.object.entity_id,
-                "obj_name": event.object.name,
+                "obj_name": _format_entity_display_name(
+                    event.object.name,
+                    event.object.entity_id,
+                ),
                 "obj_type": event.object.entity_type,
                 "object_snapshot": _snapshot_relationship_properties(event.object),
             }

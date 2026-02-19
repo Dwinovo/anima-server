@@ -171,6 +171,15 @@ def execute_action_node(state: AgentState) -> dict[str, list[ToolMessage]]:
     content = args.get("content")
     target_post_id = args.get("target_post_id")
 
+    # 可观测性：打印每次 Agent 决策出的动作 payload，便于线上追踪行为选择。
+    print(
+        (
+            "[AgentActionPayload] "
+            f"session_id={session_id} agent_uuid={agent_uuid} payload={args!r}"
+        ),
+        flush=True,
+    )
+
     try:
         action_type = ActionType(args.get("action_type"))
     except ValueError:

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from app.api.schemas.response import APIResponse
 from app.prompts import render_agent_system_prompt
 from app.runtime import anima_app
+from app.services.agent_registry import remember_agent_id
 
 router = APIRouter()
 
@@ -62,6 +63,7 @@ def register_agent(
                 "agent_uuid": payload.entity_uuid,
             },
         )
+        remember_agent_id(payload.session_id, payload.entity_uuid)
         response.status_code = status.HTTP_200_OK
         return APIResponse[AgentRegisterData].success(
             data=AgentRegisterData(
@@ -89,6 +91,7 @@ def register_agent(
             "messages": [sys_msg],
         },
     )
+    remember_agent_id(payload.session_id, payload.entity_uuid)
     response.status_code = status.HTTP_201_CREATED
     return APIResponse[AgentRegisterData].success(
         data=AgentRegisterData(
