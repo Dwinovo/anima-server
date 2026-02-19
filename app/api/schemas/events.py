@@ -21,6 +21,11 @@ class MinecraftLocation(BaseModel):
     )
 
 
+class MinecraftEntityState(BaseModel):
+    health: float = Field(..., description="当前生命值")
+    max_health: float = Field(..., description="最大生命值")
+
+
 class MinecraftEntity(BaseModel):
     entity_id: str = Field(
         ...,
@@ -38,12 +43,9 @@ class MinecraftEntity(BaseModel):
         None,
         description="该实体在当前事件发生时的物理位置",
     )
-    state: Dict[str, Any] = Field(
-        default_factory=dict,
-        description=(
-            "实体的瞬时状态集合（如: 血量、饱食度、手持物品、特定槽位内容）。"
-            "这是 Agent 做出下一步决策的核心依据。"
-        ),
+    state: MinecraftEntityState = Field(
+        ...,
+        description="实体的生存指标状态（health/max_health）",
     )
 
 

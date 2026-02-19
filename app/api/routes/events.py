@@ -7,7 +7,8 @@ from fastapi import APIRouter
 from app.api.schemas.events import EventResponse
 from app.api.schemas.events import EventRequest
 from app.api.schemas.response import APIResponse
-from app.services.neo4j_event_store import ingest_minecraft_event
+from app.services.neo4j_event_store import get_neo4j_driver
+from app.services.neo4j_event_store import ingest_event_to_neo4j
 
 router = APIRouter()
 
@@ -26,7 +27,7 @@ def process_event(payload: EventRequest) -> APIResponse[EventResponse]:
         f"session_id={session_id} source_thread_id={source_thread_id} "
         f"event={json.dumps(payload.model_dump(), ensure_ascii=False)}"
     )
-    ingest_minecraft_event(payload)
+    ingest_event_to_neo4j(get_neo4j_driver(), payload)
     print(f"[events] Event persisted to Neo4j session_id={session_id} source_thread_id={source_thread_id}")
 
     response_payload = APIResponse[EventResponse].success(

@@ -3,120 +3,144 @@ from __future__ import annotations
 import json
 import os
 from threading import Lock
+from uuid import uuid4
+
+from neo4j import Driver
+from neo4j import GraphDatabase
 
 from app.api.schemas.events import EventRequest
-
-try:
-    from langchain_neo4j import Neo4jGraph
-except ImportError:  # pragma: no cover - optional dependency
-    Neo4jGraph = None  # type: ignore[assignment]
+from app.api.schemas.events import MinecraftEntity
 
 
-_GRAPH_LOCK = Lock()
-_GRAPH: Neo4jGraph | None = None
+# 进程内复用一个 Neo4j Driver，避免每次请求都重新建连。
+_DRIVER_LOCK = Lock()
+_DRIVER: Driver | None = None
 
 
-def _json_string(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False)
+def _escape_cypher_identifier(raw: str) -> str:
+    """最小转义：仅处理反引号，其他字符（含冒号）保持原样。"""
+    return raw.replace("`", "``")
 
 
-def _resolve_location_fields(entity_location) -> tuple[str | None, str | None, float | None, float | None, float | None]:
-    if entity_location is None:
-        return None, None, None, None, None
-    x, y, z = entity_location.coordinates
-    return entity_location.dimension, entity_location.biome, x, y, z
+def _snapshot_relationship_properties(entity: MinecraftEntity) -> dict[str, object]:
+    """关系快照：仅存展开字段，不存 JSON 保底。"""
+    dimension: str | None = None
+    biome: str | None = None
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+    if entity.location is not None:
+        dimension = entity.location.dimension
+        biome = entity.location.biome
+        x, y, z = entity.location.coordinates
+
+    return {
+        "state_health": entity.state.health,
+        "state_max_health": entity.state.max_health,
+        "location_dimension": dimension,
+        "location_biome": biome,
+        "location_x": x,
+        "location_y": y,
+        "location_z": z,
+    }
 
 
-def _get_graph() -> Neo4jGraph:
-    global _GRAPH
-    if _GRAPH is not None:
-        return _GRAPH
+def get_neo4j_driver() -> Driver:
+    """返回全局 Neo4j Driver（懒加载 + 线程安全）。"""
 
-    if Neo4jGraph is None:
-        raise RuntimeError("langchain-neo4j is not installed. Please install langchain-neo4j and neo4j.")
+    global _DRIVER
+    if _DRIVER is not None:
+        return _DRIVER
 
     url = os.getenv("NEO4J_URL")
     username = os.getenv("NEO4J_USERNAME")
     password = os.getenv("NEO4J_PASSWORD")
-    database = os.getenv("NEO4J_DATABASE")
     if not url or not username or not password:
         raise RuntimeError("NEO4J_URL/NEO4J_USERNAME/NEO4J_PASSWORD must be set.")
 
-    with _GRAPH_LOCK:
-        if _GRAPH is None:
-            kwargs = {
-                "url": url,
-                "username": username,
-                "password": password,
-                # We only execute writes here; disabling schema refresh avoids APOC requirement.
-                "refresh_schema": False,
-            }
-            if database:
-                kwargs["database"] = database
-            _GRAPH = Neo4jGraph(**kwargs)
-
-    return _GRAPH
+    with _DRIVER_LOCK:
+        if _DRIVER is None:
+            _DRIVER = GraphDatabase.driver(url, auth=(username, password))
+    return _DRIVER
 
 
-def ingest_minecraft_event(payload: EventRequest) -> None:
-    sub_dim, sub_biome, sub_x, sub_y, sub_z = _resolve_location_fields(payload.subject.location)
-    if payload.object is None:
-        raise ValueError("EventRequest.object is required for subject->object graph insertion.")
+def ingest_event_to_neo4j(driver: Driver, event: EventRequest) -> str:
+    """把 EventRequest 写入 Neo4j（Event Node / Reification 模型）。
 
-    obj_dim, obj_biome, obj_x, obj_y, obj_z = _resolve_location_fields(payload.object.location)
-    params = {
-        "session_id": payload.session_id,
-        "world_time": payload.world_time,
-        "timestamp": payload.timestamp,
-        "verb": payload.action.verb,
-        "action_details_json": _json_string(payload.action.details),
-        "sub_id": payload.subject.entity_id,
-        "sub_type": payload.subject.entity_type,
-        "sub_name": payload.subject.name,
-        "sub_state_json": _json_string(payload.subject.state),
-        "sub_dim": sub_dim,
-        "sub_biome": sub_biome,
-        "sub_x": sub_x,
-        "sub_y": sub_y,
-        "sub_z": sub_z,
-        "obj_id": payload.object.entity_id,
-        "obj_type": payload.object.entity_type,
-        "obj_name": payload.object.name,
-        "obj_state_json": _json_string(payload.object.state),
-        "obj_dim": obj_dim,
-        "obj_biome": obj_biome,
-        "obj_x": obj_x,
-        "obj_y": obj_y,
-        "obj_z": obj_z,
-    }
-
-    query = """
-    // 主语节点：Entity
-    MERGE (sub:Entity {session_id: $session_id, entity_id: $sub_id})
-    SET sub.entity_type = $sub_type,
-        sub.name = $sub_name,
-        sub.last_state_json = $sub_state_json,
-        sub.dimension = $sub_dim,
-        sub.biome = $sub_biome,
-        sub.x = $sub_x, sub.y = $sub_y, sub.z = $sub_z,
-        sub.updated_at = $timestamp
-
-    // 宾语节点：Entity
-    MERGE (obj:Entity {session_id: $session_id, entity_id: $obj_id})
-    SET obj.entity_type = $obj_type,
-        obj.name = $obj_name,
-        obj.last_state_json = $obj_state_json,
-        obj.dimension = $obj_dim,
-        obj.biome = $obj_biome,
-        obj.x = $obj_x, obj.y = $obj_y, obj.z = $obj_z,
-        obj.updated_at = $timestamp
-
-    // 核心主线：主语 -> 宾语，关系只保留动词所需字段
-    CREATE (sub)-[rel:INTERACTED_WITH]->(obj)
-    SET rel.verb = $verb,
-        rel.details = $action_details_json,
-        rel.world_time = $world_time
+    图结构：
+    - (sub:Entity)-[:INITIATED {snapshot...}]->(evt:Event)
+    - (evt)-[:TARGETED {snapshot...}]->(obj:Entity)  # 当 object 存在
     """
 
-    graph = _get_graph()
-    graph.query(query, params=params)
+    # 事件节点每次 CREATE，必须拥有独立 ID 以形成可追溯时序。
+    event_id = str(uuid4())
+
+    # Entity 动态子标签按 entity_type 原样使用（仅做反引号转义防止语法错误）。
+    subject_label = _escape_cypher_identifier(event.subject.entity_type)
+    object_label = _escape_cypher_identifier(event.object.entity_type) if event.object is not None else None
+
+    query = f"""
+    // Entity 节点只存稳定身份信息，不存瞬时状态（HP/坐标）
+    MERGE (sub:Entity:`{subject_label}` {{session_id: $session_id, entity_id: $sub_id}})
+    SET sub.name = $sub_name,
+        sub.entity_type = $sub_type
+
+    // 每次请求必须 CREATE 新事件节点，形成可追溯时间序列
+    CREATE (evt:Event {{
+        event_id: $event_id,
+        session_id: $session_id,
+        timestamp: $timestamp,
+        world_time: $world_time,
+        verb: $verb,
+        details: $details
+    }})
+
+    // Subject -> Event：在 INITIATED 关系上保存发起者快照状态
+    CREATE (sub)-[init:INITIATED]->(evt)
+    SET init += $subject_snapshot
+    """
+
+    if event.object is not None and object_label is not None:
+        query += f"""
+        // Object 节点同样只维护稳定身份
+        MERGE (obj:Entity:`{object_label}` {{session_id: $session_id, entity_id: $obj_id}})
+        SET obj.name = $obj_name,
+            obj.entity_type = $obj_type
+
+        // Event -> Object：在 TARGETED 关系上保存承受者快照状态
+        CREATE (evt)-[tgt:TARGETED]->(obj)
+        SET tgt += $object_snapshot
+        """
+
+    # details 不展开，整段以 JSON 字符串存储。
+    params: dict[str, object] = {
+        "event_id": event_id,
+        "session_id": event.session_id,
+        "timestamp": event.timestamp,
+        "world_time": event.world_time,
+        "verb": event.action.verb,
+        "details": json.dumps(event.action.details, ensure_ascii=False),
+        "sub_id": event.subject.entity_id,
+        "sub_name": event.subject.name,
+        "sub_type": event.subject.entity_type,
+        "subject_snapshot": _snapshot_relationship_properties(event.subject),
+    }
+
+    if event.object is not None:
+        params.update(
+            {
+                "obj_id": event.object.entity_id,
+                "obj_name": event.object.name,
+                "obj_type": event.object.entity_type,
+                "object_snapshot": _snapshot_relationship_properties(event.object),
+            }
+        )
+
+    # 支持多数据库部署；不配时使用 Neo4j 默认数据库。
+    database = os.getenv("NEO4J_DATABASE")
+
+    with driver.session(database=database) as session:
+        # 所有写操作都放到 write transaction，保证失败时自动回滚。
+        session.execute_write(lambda tx: tx.run(query, params).consume())
+
+    return event_id
